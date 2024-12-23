@@ -1,8 +1,22 @@
+use crate::cpu::combine_u8;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::pin::Pin;
 
+pub fn make_mbc(fp: &str) -> Box<dyn Mbc + 'static> {
+    let mut buf = Vec::new();
+    BufReader::new(File::open(fp).unwrap())
+        .read_to_end(&mut buf)
+        .unwrap();
+    match buf[0x0147] {
+        0 => Box::new(Mbc0::new(buf)),
+        _ => todo!("UNSUPPORTED MBC {:#04x}", buf[0x0147]),
+    }
+}
+
 pub trait Mbc: Send {
-    fn read(&self, addr: u16, buf: &mut [u8]);
-    fn write(&mut self, addr: u16, buf: &mut [u8]);
+    fn read_byte(&self, addr: u16) -> u8;
+    fn read_word(&self, addr: u16) -> u16;
     fn boot(&self);
 }
 
@@ -11,14 +25,13 @@ pub struct Mbc0 {
 }
 
 impl Mbc for Mbc0 {
-    fn read(&self, addr: u16, buf: &mut [u8]) {
-        let addr: u64 = addr as u64;
-        let end: u64 = buf.len() as u64 + addr;
-        match addr {
-            0x0000..0x8000 => buf.copy_from_slice(&self.data[addr..end]),
-            _ => panic!("MBC0 CANNOT READ {:#06x}", addr),
-        }
+    fn read_byte(&self, addr: u16) -> u8 {
+        self.data[addr as usize]
     }
+    fn read_word(&self, addr: u16) -> u16 {
+        combine_u8(self.data[addr as usize + 1], self.data[addr as usize])
+    }
+    fn boot(&self) {}
 }
 
 impl Mbc0 {
