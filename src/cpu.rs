@@ -39,33 +39,12 @@ impl Cpu {
     }
 
     pub fn exec(&mut self, opcode: u8) -> u32 {
-        let (o2, o1, o0) = (
-            (opcode & 0b1100_0000) >> 6,
-            (opcode & 0b0011_1000) >> 3,
-            (opcode & 0b0000_0111),
-        );
-        match (o2, o1, o0) {
-            (0, 0, 0) => 1,                              // NOP
-            (0, _, 2) => self.ld_ref(o2, o1),            // LD [r16 | A], [A | r16]
-            (0, 3.., 0) => self.jr(o1),                  // JR (cc), e8
-            (1, 6, 6) => unimplemented!("HALT"),         // HALT
-            (1, _, _) => self.ld_8(o2, o1, o0),          // LD DST, SRC
-            (2, _, _) => self.alu_r8(o1, o0),            // ALU r8
-            (3, _, 6) => self.alu_n8(o1),                // ALU n8
-            (3, 0..=3, 0) => self.ret_cc(o1),            // RET cc
-            (3, 4 | 6, 0 | 2) => self.ldh(o1, o0),       // LDH
-            (3, 5, 0) => unimplemented!("ADD SP, e8"),   // ADD SP, e8
-            (3, 1, 1) => self.ret(),                     // RET
-            (3, 3, 1) => unimplemented!("RETI"),         // RETI
-            (3, 0 | 2 | 4 | 6, 1) => self.pop_r16(o1),   // POP r16
-            (3, 0..=3, 2) => self.jp_cc(o1),             // JP cc, a16
-            (3, 5 | 7, 2) => self.ld_ref(o2, o1),        // LD [a16 | A], [A | a16]
-            (3, 0, 3) => self.jp_a16(),                  // JP a16
-            (3, 0..=3, 4) => self.call_a16(self.cc(o1)), // CALL cc, a16
-            (3, 1, 5) => self.call_a16(true),            // CALL a16
-            (3, 0 | 2 | 4 | 6, 5) => self.push_r16(o1),  // PUSH r16
-            (3, _, 7) => self.rst(o1),                   // RST vec
-            _ => todo!("UNIMPLEMENTED {:#04x}", opcode),
+        match opcode {
+            0x40..0x76 => self.ld_r8(opcode),
+            0x76 => todo!("HALT"),
+            0x77..0x80 => self.ld_r8(opcode),
+            0x80..0xC0 => self.alu_r8(opcode),
+            _ => todo!(),
         }
     }
 
@@ -131,26 +110,15 @@ impl Cpu {
                 self.h = self.rg[A] & 0xF < src & 0xF;
                 self.c = a > 0x100;
             } // CP A, SRC
-            _ => panic!("how"),
+            _ => (),
         }
     }
 
-    fn alu_n8(&mut self, o1: u8) -> u32 {
-        let src = self.next_byte();
-        self.alu(o1, src);
-        self.set_flags();
-        2
-    }
-
-    fn alu_r8(&mut self, o1: u8, o0: u8) -> u32 {
-        let src = self.r8_src(o0);
-        self.alu(o1, src);
-        self.set_flags();
-        if o0 == 6 {
-            2
-        } else {
-            1
-        }
+    fn alu_r8(&mut self, opcode: u8) -> u32 {
+        let op: u8 = (opcode - 0x80) / 8;
+        let src: u8 = self.r8_src(opcode);
+        self.alu(op, src);
+        1 + ((opcode & 0xF) % 8 == 6) as u32
     }
 
     fn call(&mut self, addr: u16) {
@@ -186,103 +154,17 @@ impl Cpu {
         4
     }
 
-    fn jp_cc(&mut self, o1: u8) -> u32 {
-        let addr = self.next_word();
-        if self.cc(o1) {
-            self.pc = addr;
-            4
+    fn ld_r8(&mut self, opcode: u8) -> u32 {
+        let src: u8 = self.r8_src(opcode);
+        let d: u8 = (opcode - 0x40) / 0x08;
+        if d == 6 {
+            self.write_byte(self.hl(), src);
+        } else if d == 7 {
+            self.rg[A] = src;
         } else {
-            3
+            self.rg[d as usize] = src;
         }
-    }
-
-    fn jr(&mut self, o1: u8) -> u32 {
-        let off: u8 = self.next_byte();
-        let cc: bool = {
-            if o1 == 3 {
-                true
-            } else {
-                self.cc(o1)
-            }
-        };
-        if cc {
-            self.pc = add_u16_e8(self.pc, off);
-            3
-        } else {
-            2
-        }
-    }
-
-    fn ld_8(&mut self, o2: u8, o1: u8, o0: u8) -> u32 {
-        let cycles: u32 = 1 + (o1 == 6) as u32 + (o0 == 6) as u32;
-        let src: u8 = {
-            if o2 == 0 {
-                self.next_byte()
-            } else {
-                self.r8_src(o0)
-            }
-        };
-        match o1 {
-            0 => self.rg[B] = src,
-            1 => self.rg[C] = src,
-            2 => self.rg[D] = src,
-            3 => self.rg[E] = src,
-            4 => self.rg[H] = src,
-            5 => self.rg[L] = src,
-            6 => self.mmu.write_byte(combine_u8(self.rg[H], self.rg[L]), src),
-            7 => self.rg[A] = src,
-            _ => todo!("how"),
-        }
-        cycles
-    }
-
-    fn ld_ref(&mut self, o2: u8, o1: u8) -> u32 {
-        let cycles: u32 = if o2 == 0 { 2 } else { 4 };
-        match (o2, o1) {
-            (0, 0 | 2) => {
-                let dest: u16 = combine_u8(self.rg[o1 as usize], self.rg[o1 as usize + 1]);
-                self.write_byte(dest, self.rg[A]);
-            } // LD [BC | DE], A
-            (0, 1 | 3) => {
-                let src: u16 = combine_u8(self.rg[o1 as usize - 1], self.rg[o1 as usize]);
-                self.rg[A] = self.read_byte(src);
-            } // LD A, [BC | DE]
-            (0, 4 | 6) => {
-                let addr: u16 = if o1 == 4 { self.hli() } else { self.hld() };
-                self.write_byte(addr, self.rg[A]);
-            } // LD [HLI | HLD], A
-            (0, 5 | 7) => {
-                let addr: u16 = if o1 == 5 { self.hli() } else { self.hld() };
-                self.rg[A] = self.read_byte(addr);
-            } // LD A, [HLI | HLD]
-            (3, 5) => {
-                let addr: u16 = self.next_word();
-                self.write_byte(addr, self.rg[A]);
-            } // LD [a16], A
-            (3, 7) => {
-                let addr: u16 = self.next_word();
-                self.rg[A] = self.read_byte(addr);
-            } // LD A, [a16]
-            _ => (),
-        }
-        cycles
-    }
-
-    fn ldh(&mut self, o1: u8, o0: u8) -> u32 {
-        let cycles: u32 = 2 + (o0 == 0) as u32;
-        let addr: u16 = 0xFF00 + {
-            if o0 == 0 {
-                self.next_byte() as u16
-            } else {
-                self.rg[C] as u16
-            }
-        };
-        if o1 == 4 {
-            self.write_byte(addr, self.rg[A]);
-        } else {
-            self.rg[A] = self.read_byte(addr);
-        }
-        cycles
+        1 + (opcode & 0xF0 == 0x70) as u32 + ((opcode & 0x0F) % 8 == 6) as u32
     }
 
     fn next_byte(&mut self) -> u8 {
@@ -303,69 +185,19 @@ impl Cpu {
         b
     }
 
-    fn pop_r16(&mut self, o1: u8) -> u32 {
-        match o1 {
-            0 => {
-                self.rg[C] = self.pop();
-                self.rg[B] = self.pop();
-            }
-            2 => {
-                self.rg[E] = self.pop();
-                self.rg[D] = self.pop();
-            }
-            4 => {
-                self.rg[L] = self.pop();
-                self.rg[H] = self.pop();
-            }
-            6 => {
-                self.rg[F] = self.pop();
-                self.rg[A] = self.pop();
-                self.read_flags();
-            }
-            _ => (),
-        }
-        3
-    }
-
     fn push(&mut self, b: u8) {
         self.sp = self.sp.wrapping_sub(1);
         self.stack[self.sp] = b;
     }
 
-    fn push_r16(&mut self, o1: u8) -> u32 {
-        match o1 {
-            0 => {
-                self.push(self.rg[B]);
-                self.push(self.rg[C]);
-            }
-            2 => {
-                self.push(self.rg[D]);
-                self.push(self.rg[E]);
-            }
-            4 => {
-                self.push(self.rg[H]);
-                self.push(self.rg[L]);
-            }
-            6 => {
-                self.push(self.rg[A]);
-                self.push(self.rg[F]);
-            }
-            _ => (),
-        }
-        4
-    }
-
-    fn r8_src(&self, o0: u8) -> u8 {
-        match o0 {
-            0 => self.rg[B],
-            1 => self.rg[C],
-            2 => self.rg[D],
-            3 => self.rg[E],
-            4 => self.rg[H],
-            5 => self.rg[L],
-            6 => self.read_byte(self.hl()),
-            7 => self.rg[A],
-            _ => todo!("how"),
+    fn r8_src(&self, opcode: u8) -> u8 {
+        let r: u8 = (opcode & 0x0F) % 0x08;
+        if r == 6 {
+            self.read_byte(self.hl())
+        } else if r == 7 {
+            self.rg[A]
+        } else {
+            self.rg[r as usize]
         }
     }
 
@@ -393,20 +225,6 @@ impl Cpu {
         let lo: u8 = self.pop();
         let hi: u8 = self.pop();
         self.pc = combine_u8(hi, lo);
-        4
-    }
-
-    fn ret_cc(&mut self, o1: u8) -> u32 {
-        if self.cc(o1) {
-            self.ret() + 1
-        } else {
-            2
-        }
-    }
-
-    fn rst(&mut self, o1: u8) -> u32 {
-        let vec: u16 = o1 as u16 * 8;
-        self.call(vec);
         4
     }
 
