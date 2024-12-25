@@ -40,10 +40,54 @@ impl Cpu {
 
     pub fn exec(&mut self, opcode: u8) -> u32 {
         match opcode {
-            0x40..0x76 => self.ld_r8(opcode),
-            0x76 => todo!("HALT"),
-            0x77..0x80 => self.ld_r8(opcode),
-            0x80..0xC0 => self.alu_r8(opcode),
+            0x00 => 1, // NOP
+            0x01 => {
+                (self.rg[B], self.rg[C]) = split_u16(self.next_word());
+                3
+            } // LD BC, n16
+            0x02 => {
+                self.write_byte(self.bc(), self.rg[A]);
+                2
+            } // LD [BC], A
+            0x03 => {
+                (self.rg[B], self.rg[C]) = split_u16(self.bc().wrapping_add(1));
+                2
+            } // INC BC
+            0x04 => self.alu_inc(B), // INC B
+            0x05 => self.alu_dec(B), // DEC B
+            0x40..0x76 => self.ld_r8(opcode), // LD
+            0x76 => todo!("HALT"), // HALT
+            0x77..0x80 => self.ld_r8(opcode), // LD
+            0x80..0xC0 => self.alu_r8(opcode), // ALU r8
+            0xC0 => self.ret_cc(!self.z), // RET NZ
+            0xC1 => self.pop_r16(B), // POP BC
+            0xC2 => self.jp(!self.z), // JP NZ, a16
+            0xC3 => self.jp(true), // JP a16
+            0xC4 => self.call_a16(!self.z), // CALL NZ, a16
+            0xC5 => self.push_r16(B), // PUSH BC
+            0xC6 | 0xCE | 0xD6 | 0xDE | 0xE6 | 0xEE | 0xF6 | 0xFE => self.alu_n8(opcode), // ALU n8
+            0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => self.rst(opcode), // RST $00
+            0xC8 => self.ret_cc(self.z), // RET Z
+            0xC9 => self.ret(), // RET
+            0xCA => self.jp(self.z), // JP Z, a16
+            0xCC => self.call_a16(self.z), // CALL Z, a16
+            0xCD => self.call_a16(true), // CALL a16
+            0xD0 => self.ret_cc(!self.c), // RET NC
+            0xD1 => self.pop_r16(D), // POP DE
+            0xD2 => self.jp(!self.c), // JP NC, a16
+            0xD3 => panic!("ILLEGAL OPCODE"), // ILLEGAL
+            0xD4 => self.call_a16(!self.c), // CALL NC, a16
+            0xD5 => self.push_r16(D), // PUSH DE
+            0xD8 => self.ret_cc(self.c), // RET C
+            0xD9 => todo!("RETI"), // RETI
+            0xDA => self.jp(self.c), // JP C, a16
+            0xDB => panic!("ILLEGAL OPCODE"), // ILLEGAL
+            0xDC => self.call_a16(self.c), // CALL C, a16
+            0xDD => panic!("ILLEGAL OPCODE"), // ILLEGAL
+            0xE1 => self.pop_r16(H), // POP HL
+            0xE5 => self.push_r16(H), // PUSH HL
+            0xF1 => self.pop_r16(A), // POP AF
+            0xF5 => self.push_r16(A), // PUSH AF
             _ => todo!(),
         }
     }
@@ -114,6 +158,32 @@ impl Cpu {
         }
     }
 
+    fn alu_dec(&mut self, r: usize) -> u32 {
+        let res: u8 = (self.rg[r] as u16 + 0xFF) as u8;
+        self.z = res == 0;
+        self.n = true;
+        self.h = self.rg[r] & 0xF == 0;
+        self.set_flags();
+        1
+    }
+
+    fn alu_inc(&mut self, r: usize) -> u32 {
+        let res: u8 = (self.rg[r] as u16 + 1) as u8;
+        self.z = res == 0;
+        self.n = false;
+        self.h = self.rg[r] & 0xF == 0xF;
+        self.rg[r] = res;
+        self.set_flags();
+        1
+    }
+
+    fn alu_n8(&mut self, opcode: u8) -> u32 {
+        let op: u8 = (opcode - 0xC0) / 8;
+        let src: u8 = self.next_byte();
+        self.alu(op, src);
+        2
+    }
+
     fn alu_r8(&mut self, opcode: u8) -> u32 {
         let op: u8 = (opcode - 0x80) / 8;
         let src: u8 = self.r8_src(opcode);
@@ -138,20 +208,14 @@ impl Cpu {
         }
     }
 
-    fn cc(&self, o1: u8) -> bool {
-        match o1 % 4 {
-            0 => !self.z,
-            1 => self.z,
-            2 => !self.c,
-            3 => self.c,
-            _ => panic!("how"),
+    fn jp(&mut self, cc: bool) -> u32 {
+        let addr = self.next_word();
+        if cc {
+            self.pc = addr;
+            4
+        } else {
+            3
         }
-    }
-
-    fn jp_a16(&mut self) -> u32 {
-        let addr: u16 = self.next_word();
-        self.pc = addr;
-        4
     }
 
     fn ld_r8(&mut self, opcode: u8) -> u32 {
@@ -185,9 +249,24 @@ impl Cpu {
         b
     }
 
+    fn pop_r16(&mut self, r_hi: usize) -> u32 {
+        self.rg[r_hi + 1] = self.pop();
+        self.rg[r_hi] = self.pop();
+        if r_hi == A {
+            self.read_flags();
+        }
+        3
+    }
+
     fn push(&mut self, b: u8) {
         self.sp = self.sp.wrapping_sub(1);
         self.stack[self.sp] = b;
+    }
+
+    fn push_r16(&mut self, r_hi: usize) -> u32 {
+        self.push(self.rg[r_hi]);
+        self.push(self.rg[r_hi + 1]);
+        4
     }
 
     fn r8_src(&self, opcode: u8) -> u8 {
@@ -225,6 +304,20 @@ impl Cpu {
         let lo: u8 = self.pop();
         let hi: u8 = self.pop();
         self.pc = combine_u8(hi, lo);
+        4
+    }
+
+    fn ret_cc(&mut self, cc: bool) -> u32 {
+        if cc {
+            self.ret() + 1
+        } else {
+            2
+        }
+    }
+
+    fn rst(&mut self, opcode: u8) -> u32 {
+        let vec: u16 = (opcode % 8) as u16;
+        self.call(vec);
         4
     }
 
