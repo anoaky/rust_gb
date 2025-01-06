@@ -9,7 +9,7 @@ pub fn make_mbc(fp: &str) -> Box<dyn Mbc + 'static> {
         .read_to_end(&mut buf)
         .unwrap();
     match buf[0x0147] {
-        0 => Box::new(Mbc0::new(buf)),
+        0 | 1 => Box::new(Mbc0::new(buf)),
         _ => todo!("UNSUPPORTED MBC {:#04x}", buf[0x0147]),
     }
 }
