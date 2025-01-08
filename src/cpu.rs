@@ -3,8 +3,10 @@ use crate::cpu::R16::{AF, BC, DE, HL, SP};
 use crate::cpu::R8::{A, B, C, D, E, F, H, HLA, L};
 use crate::mmu::Mmu;
 use anyhow::{bail, ensure, Result};
+use std::fs::File;
+use std::io::{BufWriter, Write};
 
-const DMG_REG: [u8; 8] = [0x00, 0x13, 0x00, 0xD8, 0x01, 0x4D, 0x01, 0x80];
+const DMG_REG: [u8; 8] = [0x00, 0x13, 0x00, 0xD8, 0x01, 0x4D, 0x01, 0xB0];
 
 pub struct Cpu {
     rg: Vec<u8>, // B, C, D, E, H, L, A, F
@@ -30,6 +32,7 @@ pub struct Cpu {
     tac_enable: bool,
     tac_select: u32,
     halted: bool,
+    debug_log: BufWriter<File>,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -64,6 +67,14 @@ impl Cpu {
             tac_enable: false,
             tac_select: 256,
             halted: false,
+            debug_log: BufWriter::new(
+                File::create(format!(
+                    "logs/{:}.log",
+                    fp.split("/").collect::<Vec<_>>().last().unwrap()
+                ))
+                .unwrap(),
+                // jesus christ
+            ),
         }
     }
 
@@ -75,7 +86,9 @@ impl Cpu {
         self.write_byte(TIMA, 0x00);
         self.write_byte(TMA, 0x00);
         self.write_byte(TAC, 0xF8);
+        self.write_byte(LY, 0x90);
         self.read_flags();
+        self.log();
     }
 
     pub fn cycle(&mut self) -> u32 {
@@ -84,6 +97,7 @@ impl Cpu {
         } else {
             let opcode: u8 = self.next_byte();
             let m_cycles: u32 = self.exec(opcode);
+            self.log();
             if self.ei && opcode != 0xFB {
                 self.ei = false;
                 self.ime = true;
@@ -250,7 +264,7 @@ impl Cpu {
             0xD8 => self.ret_cc(self.c), // RET C
             0xD9 => self.reti(),       // RETI
             0xDA => self.jp(self.c),   // JP C, a16
-            0xDB => self.debug_print(), // ILLEGAL DB TODO
+            0xDB => panic!("ILLEGAL DB"), // ILLEGAL DB
             0xDC => self.call_a16(self.c), // CALL C, a16
             0xDD => panic!("ILLEGAL DD"), // ILLEGAL DD
             0xE0 | 0xE2 | 0xF0 | 0xF2 => self.ldh(opcode), // LDH
@@ -1044,11 +1058,43 @@ impl Cpu {
         hl
     }
 
-    fn debug_print(&self) -> u32 {
-        println!("RG: {:#04x?}", self.rg);
-        println!("SP: {:#06x}", self.sp);
-        println!("STACK: {:#06x}", self.read_word(self.sp));
-        0
+    fn log(&mut self) {
+        self.set_flags();
+        write!(
+            self.debug_log,
+            "A:{:02X} F:{:02X} ",
+            self.rg[A as usize], self.rg[F as usize]
+        )
+        .unwrap();
+        write!(
+            self.debug_log,
+            "B:{:02X} C:{:02X} ",
+            self.rg[B as usize], self.rg[C as usize]
+        )
+        .unwrap();
+        write!(
+            self.debug_log,
+            "D:{:02X} E:{:02X} ",
+            self.rg[D as usize], self.rg[E as usize]
+        )
+        .unwrap();
+        write!(
+            self.debug_log,
+            "H:{:02X} L:{:02X} ",
+            self.rg[H as usize], self.rg[L as usize]
+        )
+        .unwrap();
+        write!(self.debug_log, "SP:{:04X} PC:{:04X} ", self.sp, self.pc).unwrap();
+        write!(
+            self.debug_log,
+            "PCMEM:{:02X},{:02X},{:02X},{:02X}\n",
+            self.read_byte(self.pc),
+            self.read_byte(self.pc + 1),
+            self.read_byte(self.pc + 2),
+            self.read_byte(self.pc + 3)
+        )
+        .unwrap();
+        self.debug_log.flush().unwrap();
     }
 }
 
