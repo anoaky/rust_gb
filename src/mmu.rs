@@ -35,6 +35,7 @@ impl Mmu {
 
     pub fn write_byte(&mut self, addr: u16, v: u8) {
         match addr {
+            0x0000..0x8000 => (),
             0x8000..0xA000 => self.vram[addr as usize - 0x8000] = v,
             0xC000..0xD000 => self.wram_00[addr as usize - 0xC000] = v,
             0xD000..0xE000 => self.wram_01[addr as usize - 0xD000] = v,

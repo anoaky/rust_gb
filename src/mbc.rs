@@ -5,6 +5,7 @@ use std::pin::Pin;
 
 pub fn make_mbc(fp: &str) -> Box<dyn Mbc + 'static> {
     let mut buf = Vec::new();
+    println!("{:}", fp);
     BufReader::new(File::open(fp).unwrap())
         .read_to_end(&mut buf)
         .unwrap();
