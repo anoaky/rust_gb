@@ -1,10 +1,13 @@
 use crate::constants::*;
+use crate::cpu::timing::{Div, Tima};
 use crate::cpu::R16::{AF, BC, DE, HL, SP};
 use crate::cpu::R8::{A, B, C, D, E, F, H, HLA, L};
 use crate::mmu::Mmu;
 use anyhow::{bail, ensure, Result};
 use std::fs::File;
 use std::io::{BufWriter, Write};
+
+pub mod timing;
 
 const DMG_REG: [u8; 8] = [0x00, 0x13, 0x00, 0xD8, 0x01, 0x4D, 0x01, 0xB0];
 
@@ -27,12 +30,11 @@ pub struct Cpu {
     pub n: bool,
     pub h: bool,
     pub c: bool,
-    div_acc: u32,
-    tima_acc: u32,
-    tac_enable: bool,
-    tac_select: u32,
     halted: bool,
+    div: Div,
+    tima: Tima,
     debug_log: BufWriter<File>,
+    m_cycles: u8,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -62,11 +64,10 @@ impl Cpu {
             n: false,
             h: false,
             c: false,
-            div_acc: 0,
-            tima_acc: 0,
-            tac_enable: false,
-            tac_select: 256,
             halted: false,
+            div: Div::new(),
+            tima: Tima::default(),
+            m_cycles: 0,
             debug_log: BufWriter::new(
                 File::create(format!(
                     "logs/{:}.log",
@@ -78,41 +79,38 @@ impl Cpu {
         }
     }
 
-    pub fn boot(&mut self) {
+    pub fn boot_dmg(&mut self) {
         self.rg.copy_from_slice(&DMG_REG);
-        self.write_byte(SB, 0);
-        self.write_byte(SC, 0x7E);
-        self.io[DIV as usize - 0xFF00] = 0x18;
-        self.write_byte(TIMA, 0x00);
-        self.write_byte(TMA, 0x00);
-        self.write_byte(TAC, 0xF8);
-        self.write_byte(LY, 0x90);
+        self.sb = 0;
+        self.serial_control(0x7E);
+        self.div.boot(0xAB, 0xF8);
+        self.iflags.set(0xE1);
+        // self.io[LY as usize - 0xFF00] = 0x90;
         self.read_flags();
-        self.log();
+        //self.log();
     }
 
-    pub fn cycle(&mut self) -> u32 {
+    pub fn cycle(&mut self) {
+        self.handle_interrupts();
         if self.halted {
-            1
+            self.step_timers();
         } else {
             let opcode: u8 = self.next_byte();
-            let m_cycles: u32 = self.exec(opcode);
-            self.log();
+            self.exec(opcode);
+            //self.log();
             if self.ei && opcode != 0xFB {
                 self.ei = false;
                 self.ime = true;
             }
-            m_cycles
         }
     }
 
     pub fn tick(&mut self) -> CpuTickOutput {
-        self.handle_interrupts();
+        self.m_cycles = 0;
         let mut to: CpuTickOutput = CpuTickOutput::default();
-        let m_cycles: u32 = self.cycle();
-        to.m_cycles = m_cycles;
+        self.cycle();
+        to.m_cycles = self.m_cycles as u32;
 
-        self.timers(m_cycles);
         if self.sc_enable {
             to.sb = Some(self.sb);
             self.sc_enable = false;
@@ -121,188 +119,169 @@ impl Cpu {
         to
     }
 
-    pub fn exec(&mut self, opcode: u8) -> u32 {
+    pub fn exec(&mut self, opcode: u8) {
         match opcode {
-            0x00 => 1,                 // NOP
-            0x01 => self.ld_imm16(BC), // LD BC, n16
+            0x00 => self.step_timers(), // NOP
+            0x01 => self.ld_imm16(BC),  // LD BC, n16
             0x02 => {
                 self.write_byte(self.bc(), self.rg[A as usize]);
-                2
             } // LD [BC], A
-            0x03 => self.alu_inc16(BC), // INC BC
-            0x04 => self.alu_inc8(B),  // INC B
-            0x05 => self.alu_dec8(B),  // DEC B
-            0x06 => self.ld_imm8(B),   // LD B, n8
-            0x07 => self.rlca(),       // RLCA
+            0x03 => self.alu_inc16(BC, false), // INC BC
+            0x04 => self.alu_inc8(B, false), // INC B
+            0x05 => self.alu_inc8(B, true), // DEC B
+            0x06 => self.ld_imm8(B),    // LD B, n8
+            0x07 => self.rlca(),        // RLCA
             0x08 => {
                 let addr: u16 = self.next_word();
-                self.write_word(addr, self.sp as u16);
-                5
+                self.write_word(addr, self.sp);
             } // LD [a16], SP
             0x09 => self.alu_add16(BC), // ADD HL, BC
             0x0A => {
                 self.rg[A as usize] = self.read_byte(self.bc());
-                2
             } // LD A, [BC]
-            0x0B => self.alu_dec16(BC), // DEC BC
-            0x0C => self.alu_inc8(C),  // INC C
-            0x0D => self.alu_dec8(C),  // DEC C
-            0x0E => self.ld_imm8(C),   // LD C, n8
-            0x0F => self.rrca(),       // RRCA
-            0x10 => self.stop(),       // STOP
-            0x11 => self.ld_imm16(DE), // LD DE, n16
+            0x0B => self.alu_inc16(BC, true), // DEC BC
+            0x0C => self.alu_inc8(C, false), // INC C
+            0x0D => self.alu_inc8(C, true), // DEC C
+            0x0E => self.ld_imm8(C),    // LD C, n8
+            0x0F => self.rrca(),        // RRCA
+            0x10 => self.stop(),        // STOP
+            0x11 => self.ld_imm16(DE),  // LD DE, n16
             0x12 => {
                 self.write_byte(self.de(), self.rg[A as usize]);
-                2
             } // LD [DE], A
-            0x13 => self.alu_inc16(DE), // INC DE
-            0x14 => self.alu_inc8(D),  // INC D
-            0x15 => self.alu_dec8(D),  // DEC D
-            0x16 => self.ld_imm8(D),   // LD D, n8
-            0x17 => self.rla(),        // RLA
-            0x18 => self.jr(true),     // JR e8
+            0x13 => self.alu_inc16(DE, false), // INC DE
+            0x14 => self.alu_inc8(D, false), // INC D
+            0x15 => self.alu_inc8(D, true), // DEC D
+            0x16 => self.ld_imm8(D),    // LD D, n8
+            0x17 => self.rla(),         // RLA
+            0x18 => self.jr(true),      // JR e8
             0x19 => self.alu_add16(DE), // ADD HL, DE
             0x1A => {
                 self.rg[A as usize] = self.read_byte(self.de());
-                2
             } // LD A, [DE]
-            0x1B => self.alu_dec16(DE), // DEC DE
-            0x1C => self.alu_inc8(E),  // INC E
-            0x1D => self.alu_dec8(E),  // DEC E
-            0x1E => self.ld_imm8(E),   // LD E, n8
-            0x1F => self.rra(),        // RRA
-            0x20 => self.jr(!self.z),  // JR NZ, e8
-            0x21 => self.ld_imm16(HL), // LD HL, n16
+            0x1B => self.alu_inc16(DE, true), // DEC DE
+            0x1C => self.alu_inc8(E, false), // INC E
+            0x1D => self.alu_inc8(E, true), // DEC E
+            0x1E => self.ld_imm8(E),    // LD E, n8
+            0x1F => self.rra(),         // RRA
+            0x20 => self.jr(!self.z),   // JR NZ, e8
+            0x21 => self.ld_imm16(HL),  // LD HL, n16
             0x22 => {
                 let hl: u16 = self.hli();
                 self.write_byte(hl, self.rg[A as usize]);
-                2
             } // LD [HLI], A
-            0x23 => self.alu_inc16(HL), // INC HL
-            0x24 => self.alu_inc8(H),  // INC H
-            0x25 => self.alu_dec8(H),  // DEC H
-            0x26 => self.ld_imm8(H),   // LD H, n8
-            0x27 => self.alu_daa(),    // DAA
-            0x28 => self.jr(self.z),   // JR Z, e8
+            0x23 => self.alu_inc16(HL, false), // INC HL
+            0x24 => self.alu_inc8(H, false), // INC H
+            0x25 => self.alu_inc8(H, true), // DEC H
+            0x26 => self.ld_imm8(H),    // LD H, n8
+            0x27 => self.alu_daa(),     // DAA
+            0x28 => self.jr(self.z),    // JR Z, e8
             0x29 => self.alu_add16(HL), // ADD HL, HL
             0x2A => {
                 let hl: u16 = self.hli();
                 self.rg[A as usize] = self.read_byte(hl);
-                2
             } // LD A, [HLI]
-            0x2B => self.alu_dec16(HL), // DEC HL
-            0x2C => self.alu_inc8(L),  // INC L
-            0x2D => self.alu_dec8(L),  // DEC L
-            0x2E => self.ld_imm8(L),   // LD L, n8
-            0x2F => self.alu_cpl(),    // CPL
-            0x30 => self.jr(!self.c),  // JR NC, e8
+            0x2B => self.alu_inc16(HL, true), // DEC HL
+            0x2C => self.alu_inc8(L, false), // INC L
+            0x2D => self.alu_inc8(L, true), // DEC L
+            0x2E => self.ld_imm8(L),    // LD L, n8
+            0x2F => self.alu_cpl(),     // CPL
+            0x30 => self.jr(!self.c),   // JR NC, e8
             0x31 => {
                 self.sp = self.next_word();
-                3
             } // LD SP, n16
             0x32 => {
                 let hld: u16 = self.hld();
                 self.write_byte(hld, self.rg[A as usize]);
-                2
             } // LD [HLD], A
-            0x33 => {
-                self.sp = self.sp.wrapping_add(1);
-                2
-            } // INC SP
-            0x34 => self.alu_inc8(HLA), // INC [HL]
-            0x35 => self.alu_dec8(HLA), // DEC [HL]
-            0x36 => self.ld_imm8(HLA), // LD [HL], n8
+            0x33 => self.alu_inc16(SP, false), // INC SP
+            0x34 => self.alu_inc8(HLA, false), // INC [HL]
+            0x35 => self.alu_inc8(HLA, true), // DEC [HL]
+            0x36 => self.ld_imm8(HLA),  // LD [HL], n8
             0x37 => {
                 self.n = false;
                 self.h = false;
                 self.c = true;
                 self.set_flags();
-                1
             } // SCF
-            0x38 => self.jr(self.c),   // JR C, e8
+            0x38 => self.jr(self.c),    // JR C, e8
             0x39 => self.alu_add16(SP), // ADD HL, SP
             0x3A => {
                 let hld: u16 = self.hld();
                 self.rg[A as usize] = self.read_byte(hld);
-                2
             } // LD A, [HLD]
-            0x3B => self.alu_dec16(SP), // DEC SP
-            0x3C => self.alu_inc8(A),  // INC A
-            0x3D => self.alu_dec8(A),  // DEC A
-            0x3E => self.ld_imm8(A),   // LD A, n8
+            0x3B => self.alu_inc16(SP, true), // DEC SP
+            0x3C => self.alu_inc8(A, false), // INC A
+            0x3D => self.alu_inc8(A, true), // DEC A
+            0x3E => self.ld_imm8(A),    // LD A, n8
             0x3F => {
                 self.n = false;
                 self.h = false;
                 self.c = !self.c;
                 self.set_flags();
-                1
             } // CCF
             0x40..0x76 => self.ld_r8(opcode), // LD
-            0x76 => self.halt(),       // HALT
+            0x76 => self.halt(),        // HALT
             0x77..0x80 => self.ld_r8(opcode), // LD
             0x80..0xC0 => self.alu_r8(opcode), // ALU r8
             0xC0 => self.ret_cc(!self.z), // RET NZ
-            0xC1 => self.pop_r16(BC),  // POP BC
-            0xC2 => self.jp(!self.z),  // JP NZ, a16
-            0xC3 => self.jp(true),     // JP a16
+            0xC1 => self.pop_r16(BC),   // POP BC
+            0xC2 => self.jp(!self.z),   // JP NZ, a16
+            0xC3 => self.jp(true),      // JP a16
             0xC4 => self.call_a16(!self.z), // CALL NZ, a16
-            0xC5 => self.push_r16(BC), // PUSH BC
+            0xC5 => self.push_r16(BC),  // PUSH BC
             0xC6 | 0xCE | 0xD6 | 0xDE | 0xE6 | 0xEE | 0xF6 | 0xFE => self.alu_n8(opcode), // ALU n8
             0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => self.rst(opcode), // RST $00
             0xC8 => self.ret_cc(self.z), // RET Z
-            0xC9 => self.ret(),        // RET
-            0xCA => self.jp(self.z),   // JP Z, a16
-            0xCB => self.cb(),         // PREFIX
+            0xC9 => self.ret(),         // RET
+            0xCA => self.jp(self.z),    // JP Z, a16
+            0xCB => self.cb(),          // PREFIX
             0xCC => self.call_a16(self.z), // CALL Z, a16
             0xCD => self.call_a16(true), // CALL a16
             0xD0 => self.ret_cc(!self.c), // RET NC
-            0xD1 => self.pop_r16(DE),  // POP DE
-            0xD2 => self.jp(!self.c),  // JP NC, a16
+            0xD1 => self.pop_r16(DE),   // POP DE
+            0xD2 => self.jp(!self.c),   // JP NC, a16
             0xD3 => panic!("ILLEGAL D3"), // ILLEGAL D3
             0xD4 => self.call_a16(!self.c), // CALL NC, a16
-            0xD5 => self.push_r16(DE), // PUSH DE
+            0xD5 => self.push_r16(DE),  // PUSH DE
             0xD8 => self.ret_cc(self.c), // RET C
-            0xD9 => self.reti(),       // RETI
-            0xDA => self.jp(self.c),   // JP C, a16
+            0xD9 => self.reti(),        // RETI
+            0xDA => self.jp(self.c),    // JP C, a16
             0xDB => panic!("ILLEGAL DB"), // ILLEGAL DB
             0xDC => self.call_a16(self.c), // CALL C, a16
             0xDD => panic!("ILLEGAL DD"), // ILLEGAL DD
             0xE0 | 0xE2 | 0xF0 | 0xF2 => self.ldh(opcode), // LDH
-            0xE1 => self.pop_r16(HL),  // POP HL
+            0xE1 => self.pop_r16(HL),   // POP HL
             0xE3 => panic!("ILLEGAL E3"), // ILLEGAL E3
             0xE4 => panic!("ILLEGAL E4"), // ILLEGAL E4
-            0xE5 => self.push_r16(HL), // PUSH HL
+            0xE5 => self.push_r16(HL),  // PUSH HL
             0xE8 => {
                 let e8: u8 = self.next_byte();
-                let (res, _, h, c) = add_u16_e8(self.sp as u16, e8);
+                let (res, _, h, c) = add_u16_e8(self.sp, e8);
                 self.z = false;
                 self.n = false;
                 self.h = h;
                 self.c = c;
                 self.sp = res;
                 self.set_flags();
-                4
             } // ADD SP, e8
             0xE9 => {
                 self.pc = self.hl();
-                1
             } // JP HL
             0xEA => {
                 let addr: u16 = self.next_word();
                 self.write_byte(addr, self.rg[A as usize]);
-                4
             } // LD [a16], A
             0xEB => panic!("ILLEGAL EB"), // ILLEGAL EB
             0xEC => panic!("ILLEGAL EC"), // ILLEGAL EC
             0xED => panic!("ILLEGAL ED"), // ILLEGAL ED
-            0xF1 => self.pop_r16(AF),  // POP AF
+            0xF1 => self.pop_r16(AF),   // POP AF
             0xF3 => {
                 self.ei = false;
                 self.ime = false;
-                1
             } // DI
             0xF4 => panic!("ILLEGAL F4"), // ILLEGAL F4
-            0xF5 => self.push_r16(AF), // PUSH AF
+            0xF5 => self.push_r16(AF),  // PUSH AF
             0xF8 => {
                 let e8: u8 = self.next_byte();
                 let (sp, _, h, c) = add_u16_e8(self.sp as u16, e8);
@@ -312,27 +291,23 @@ impl Cpu {
                 self.c = c;
                 (self.rg[H as usize], self.rg[L as usize]) = split_u16(sp);
                 self.set_flags();
-                3
             } // LD HL, SP + e8
             0xF9 => {
                 self.sp = self.hl();
-                2
             } // LD SP, HL
             0xFA => {
                 let addr: u16 = self.next_word();
                 self.rg[A as usize] = self.read_byte(addr);
-                4
             } // LD A, [a16]
             0xFB => {
                 self.ei = true;
-                1
             } // EI
             0xFC => panic!("ILLEGAL FC"), // ILLEGAL FC
             0xFD => panic!("ILLEGAL FD"), // ILLEGAL FD
         }
     }
 
-    pub fn cb(&mut self) -> u32 {
+    pub fn cb(&mut self) {
         let opcode: u8 = self.next_byte();
         let r: R8 = R8::try_from((opcode & 0x0F) % 8).unwrap();
         let src: u8 = {
@@ -359,12 +334,10 @@ impl Cpu {
             if opcode < 0x40 || opcode >= 0x80 {
                 self.write_byte(self.hl(), res);
             }
-            3 + (opcode < 0x40 || opcode >= 0x80) as u32
         } else {
             if opcode < 0x40 || opcode >= 0x80 {
                 self.rg[r as usize] = res;
             }
-            2
         }
     }
 
@@ -398,14 +371,6 @@ impl Cpu {
             7 => {
                 let a: u8 = self.rg[A as usize];
                 self.alu_sub(src, false);
-                // if (src == self.rg[E as usize]) && (self.read_byte(self.pc) == 0xC2) {
-                //     println!("CP {:#04x} {:#04x}", a, src);
-                //     if a != src {
-                //         println!("STACK: {:#04x?}", &self.stack[self.sp - 2..self.sp + 2]);
-                //         println!("REGS: {:#04x?}", self.rg);
-                //         panic!()
-                //     }
-                // }
                 self.rg[A as usize] = a;
             } // CP A, SRC
             _ => (),
@@ -424,7 +389,7 @@ impl Cpu {
         self.rg[A as usize] = res;
     }
 
-    fn alu_add16(&mut self, r: R16) -> u32 {
+    fn alu_add16(&mut self, r: R16) {
         let a: u16 = self.hl();
         let b: u16 = match r {
             BC => self.bc(),
@@ -439,7 +404,6 @@ impl Cpu {
         self.c = res > 0xFFFF;
         self.set_flags();
         (self.rg[H as usize], self.rg[L as usize]) = split_u16(res as u16);
-        2
     }
 
     fn alu_bit(&mut self, src: u8, shift: u8) -> u8 {
@@ -454,16 +418,15 @@ impl Cpu {
         0
     }
 
-    fn alu_cpl(&mut self) -> u32 {
+    fn alu_cpl(&mut self) {
         let a: u8 = self.rg[A as usize];
         self.rg[A as usize] = !a;
         self.n = true;
         self.h = true;
         self.set_flags();
-        1
     }
 
-    fn alu_daa(&mut self) -> u32 {
+    fn alu_daa(&mut self) {
         let mut a: u8 = self.rg[A as usize];
         if !self.n {
             if self.c || a > 0x99 {
@@ -485,10 +448,9 @@ impl Cpu {
         self.h = false;
         self.rg[A as usize] = a;
         self.set_flags();
-        1
     }
 
-    fn alu_dec8(&mut self, r: R8) -> u32 {
+    fn alu_inc8(&mut self, r: R8, neg: bool) {
         let b: u8 = {
             if r == HLA {
                 self.read_byte(self.hl())
@@ -496,29 +458,35 @@ impl Cpu {
                 self.rg[r as usize]
             }
         };
-        let res: u8 = b.wrapping_sub(1);
+        let res: u8 = if neg {
+            b.wrapping_sub(1)
+        } else {
+            b.wrapping_add(1)
+        };
         self.z = res == 0;
-        self.n = true;
-        self.h = b & 0xF == 0;
+        self.n = neg;
+        self.h = b & 0x0F == if neg { 0 } else { 0x0F };
         self.set_flags();
         if r == HLA {
             self.write_byte(self.hl(), res);
-            3
         } else {
             self.rg[r as usize] = res;
-            1
         }
     }
 
-    fn alu_dec16(&mut self, r: R16) -> u32 {
+    fn alu_inc16(&mut self, r: R16, neg: bool) {
         let b: u16 = match r {
             BC => self.bc(),
             DE => self.de(),
             HL => self.hl(),
             AF => panic!(),
-            SP => self.sp as u16,
+            SP => self.sp,
         };
-        let res: u16 = b.wrapping_sub(1);
+        let res: u16 = if neg {
+            b.wrapping_sub(1)
+        } else {
+            b.wrapping_add(1)
+        };
         if r == SP {
             self.sp = res;
         } else {
@@ -526,62 +494,18 @@ impl Cpu {
             (self.rg[rh as usize], self.rg[rl as usize]) = split_u16(res);
         }
         self.set_flags();
-        2
     }
 
-    fn alu_inc8(&mut self, r: R8) -> u32 {
-        let b: u8 = {
-            if r == HLA {
-                self.read_byte(self.hl())
-            } else {
-                self.rg[r as usize]
-            }
-        };
-        let res: u8 = b.wrapping_add(1);
-        self.z = res == 0;
-        self.n = false;
-        self.h = b & 0x0F == 0x0F;
-        self.set_flags();
-        if r == HLA {
-            self.write_byte(self.hl(), res);
-            3
-        } else {
-            self.rg[r as usize] = res;
-            1
-        }
-    }
-
-    fn alu_inc16(&mut self, r: R16) -> u32 {
-        let b: u16 = match r {
-            BC => self.bc(),
-            DE => self.de(),
-            HL => self.hl(),
-            AF => panic!(),
-            SP => self.sp as u16,
-        };
-        let res: u16 = b.wrapping_add(1);
-        if r == SP {
-            self.sp = res;
-        } else {
-            let (rh, rl): (R8, R8) = r16_to_hi_lo(r);
-            (self.rg[rh as usize], self.rg[rl as usize]) = split_u16(res);
-        }
-        self.set_flags();
-        2
-    }
-
-    fn alu_n8(&mut self, opcode: u8) -> u32 {
+    fn alu_n8(&mut self, opcode: u8) {
         let op: u8 = (opcode - 0xC0) / 8;
         let src: u8 = self.next_byte();
         self.alu(op, src);
-        2
     }
 
-    fn alu_r8(&mut self, opcode: u8) -> u32 {
+    fn alu_r8(&mut self, opcode: u8) {
         let op: u8 = (opcode - 0x80) / 8;
         let src: u8 = self.r8_src(opcode);
         self.alu(op, src);
-        1 + ((opcode & 0xF) % 8 == 6) as u32
     }
 
     fn alu_res(&mut self, src: u8, shift: u8) -> u8 {
@@ -606,28 +530,30 @@ impl Cpu {
     }
 
     fn call(&mut self, addr: u16) {
+        // 3M
         self.push(self.pc);
+        self.step_timers();
         self.pc = addr;
     }
 
-    fn call_a16(&mut self, cc: bool) -> u32 {
+    fn call_a16(&mut self, cc: bool) {
+        // INSTR: CALL cc,a16
+        // FETCH OP: 1M
+        // READ a16: 2M
+        // CALL: 3M
+        // TOTAL: 3 / 6
         let addr: u16 = self.next_word();
         if cc {
             self.call(addr);
-            6
-        } else {
-            3
         }
     }
 
-    fn halt(&mut self) -> u32 {
+    fn halt(&mut self) {
         if self.ime || self.ienable.read() & self.iflags.read() == 0 {
             self.halted = true;
-            0
         } else {
             // HALT BUG
-            let opcode: u8 = self.next_byte();
-            self.pc -= 1;
+            let opcode: u8 = self.read_byte(self.pc);
             self.exec(opcode)
         }
     }
@@ -663,38 +589,47 @@ impl Cpu {
         }
     }
 
-    fn jp(&mut self, cc: bool) -> u32 {
+    fn jp(&mut self, cc: bool) {
+        // JP cc,a16
+        // FETCH OP: 1M
+        // FETCH a16: 2M
+        // JP IF cc: 1M
+        // TOTAL: 3/4
         let addr = self.next_word();
         if cc {
             self.pc = addr;
-            4
-        } else {
-            3
+            self.step_timers();
         }
     }
 
-    fn jr(&mut self, cc: bool) -> u32 {
+    fn jr(&mut self, cc: bool) {
+        // JR cc,e8
+        // FETCH OP: 1M
+        // FETCH e8: 1M
+        // JP IF cc: 1M
+        // TOTAL: 2/3
         let e8: u8 = self.next_byte();
         let (addr, _, _, _) = add_u16_e8(self.pc, e8);
         if cc {
             self.pc = addr;
-            3
-        } else {
-            2
+            self.step_timers();
         }
     }
 
-    fn ld_imm8(&mut self, r: R8) -> u32 {
+    fn ld_imm8(&mut self, r: R8) {
         let b: u8 = self.next_byte();
         if r == HLA {
             self.write_byte(self.hl(), b);
         } else {
             self.rg[r as usize] = b;
         }
-        2 + (r == HLA) as u32
     }
 
-    fn ld_imm16(&mut self, r: R16) -> u32 {
+    fn ld_imm16(&mut self, r: R16) {
+        // INSTR: LD r16,n16
+        // FETCH OP: 1M
+        // FETCH n16: 2M
+        // TOTAL: 3M
         let w: u16 = self.next_word();
         let (rh, rl): (R8, R8) = match r {
             BC => (B, C),
@@ -703,12 +638,15 @@ impl Cpu {
             _ => panic!(),
         };
         (self.rg[rh as usize], self.rg[rl as usize]) = split_u16(w);
-        3
     }
 
-    fn ld_r8(&mut self, opcode: u8) -> u32 {
+    fn ld_r8(&mut self, opcode: u8) {
+        // INSTR: LD r8,r8
+        // FETCH OP: 1M
+        // FETCH/WRITE IF [HL]: 1M
+        // TOTAL: 1 / 2
         let src: u8 = self.r8_src(opcode);
-        let d: u8 = (opcode - 0x40) / 0x08;
+        let d: u8 = (opcode & 63) >> 3;
         if d == 6 {
             self.write_byte(self.hl(), src);
         } else if d == 7 {
@@ -716,10 +654,14 @@ impl Cpu {
         } else {
             self.rg[d as usize] = src;
         }
-        1 + (opcode & 0xF0 == 0x70) as u32 + ((opcode & 0x0F) % 8 == 6) as u32
     }
 
-    fn ldh(&mut self, opcode: u8) -> u32 {
+    fn ldh(&mut self, opcode: u8) {
+        // INSTR: LDH
+        // FETCH OP: 1M
+        // READ IF !c: 1M
+        // READ/WRITE MEM: 1M
+        // TOTAL: 2 / 3
         let c: bool = opcode & 0x0F == 0x02;
         let rd: bool = opcode & 0xF0 == 0xF0;
         let addr: u16 = {
@@ -734,7 +676,6 @@ impl Cpu {
         } else {
             self.write_byte(addr, self.rg[A as usize]);
         }
-        2 + c as u32
     }
 
     fn next_byte(&mut self) -> u8 {
@@ -744,33 +685,44 @@ impl Cpu {
     }
 
     fn next_word(&mut self) -> u16 {
-        let word = self.read_word(self.pc);
+        let lo: u8 = self.read_byte(self.pc);
+        let hi: u8 = self.read_byte(self.pc + 1);
         self.pc += 2;
-        word
+        combine_u8(hi, lo)
     }
 
     fn pop(&mut self) -> u16 {
-        let r: u16 = self.read_word(self.sp);
+        let lo: u8 = self.read_byte(self.sp);
+        let hi: u8 = self.read_byte(self.sp + 1);
         self.sp += 2;
-        r
+        combine_u8(hi, lo)
     }
 
-    fn pop_r16(&mut self, r: R16) -> u32 {
+    fn pop_r16(&mut self, r: R16) {
+        // INSTR: POP r16
+        // FETCH OP: 1M
+        // POP: 2M
+        // TOTAL: 3M
         let (r_hi, r_lo) = r16_to_hi_lo(r);
         (self.rg[r_hi as usize], self.rg[r_lo as usize]) = split_u16(self.pop());
         if r == AF {
             self.read_flags();
         }
-        3
     }
 
     fn push(&mut self, b: u16) {
-        self.write_word(self.sp - 2, b);
+        let (hi, lo) = split_u16(b);
+        self.write_byte(self.sp - 1, hi);
+        self.write_byte(self.sp - 2, lo);
         self.sp -= 2;
-        // println!("PUSH {:#06x}", b);
     }
 
-    fn push_r16(&mut self, r: R16) -> u32 {
+    fn push_r16(&mut self, r: R16) {
+        // INSTR: PUSH r16
+        // FETCH OP: 1M
+        // PUSH: 2M
+        // ??: 1M
+        // TOTAL: 4M
         match r {
             BC => self.push(self.bc()),
             DE => self.push(self.de()),
@@ -780,11 +732,11 @@ impl Cpu {
                 self.push(af);
             }
             SP => panic!(),
-        }
-        4
+        };
+        self.step_timers();
     }
 
-    fn r8_src(&self, opcode: u8) -> u8 {
+    fn r8_src(&mut self, opcode: u8) -> u8 {
         let r: u8 = (opcode & 0x0F) % 0x08;
         if r == 6 {
             self.read_byte(self.hl())
@@ -795,11 +747,16 @@ impl Cpu {
         }
     }
 
-    fn read_byte(&self, addr: u16) -> u8 {
+    fn read_byte(&mut self, addr: u16) -> u8 {
+        self.step_timers();
         match addr {
             SB => self.sb,
             SC => self.read_sc(),
             IF => self.iflags.read(),
+            TIMA => self.tima.tima(),
+            TMA => self.tima.tma,
+            TAC => self.div.tac,
+            DIV => self.div.div(),
             0xFF00..0xFF80 => self.io[addr as usize - 0xFF00],
             0xFF80..0xFFFF => self.hram[addr as usize - 0xFF80],
             IE => self.ienable.read(),
@@ -814,37 +771,40 @@ impl Cpu {
         self.n = (f & 0x40) >> 6 == 1;
         self.h = (f & 0x20) >> 5 == 1;
         self.c = (f & 0x10) >> 4 == 1;
-        // println!(
-        //     "Z: {:} N: {:} H: {:} C: {:}",
-        //     self.z, self.n, self.h, self.c
-        // );
     }
 
     fn read_sc(&self) -> u8 {
         (self.sc_enable as u8) << 7 | (self.sc_speed as u8) << 1 | self.sc_select as u8
     }
 
-    fn read_word(&self, addr: u16) -> u16 {
-        let lo: u8 = self.read_byte(addr);
-        let hi: u8 = self.read_byte(addr + 1);
-        combine_u8(hi, lo)
-    }
-
-    fn ret(&mut self) -> u32 {
+    fn ret(&mut self) {
+        // INSTR: RET
+        // FETCH OP: 1M
+        // POP: 2M
+        // ??: 1M
+        // TOTAL: 4M
         self.pc = self.pop();
-        4
+        self.step_timers();
     }
 
-    fn reti(&mut self) -> u32 {
+    fn reti(&mut self) {
+        // INSTR: RETI
+        // FETCH OP: 1M
+        // RETURN: 3M
+        // TOTAL: 4M
         self.ime = true;
-        self.ret()
+        self.ret();
     }
 
-    fn ret_cc(&mut self, cc: bool) -> u32 {
+    fn ret_cc(&mut self, cc: bool) {
+        // INSTR: RET cc
+        // FETCH OP: 1M
+        // ??: 1M
+        // RETURN IF cc: 3M
+        // TOTAL: 2/5
+        self.step_timers();
         if cc {
-            self.ret() + 1
-        } else {
-            2
+            self.ret();
         }
     }
 
@@ -855,13 +815,12 @@ impl Cpu {
         res
     }
 
-    fn rla(&mut self) -> u32 {
+    fn rla(&mut self) {
         self.rg[A as usize] = self.rl(self.rg[A as usize]);
         if self.z {
             self.z = false;
             self.set_flags();
         }
-        1
     }
 
     fn rlc(&mut self, b: u8) -> u8 {
@@ -871,13 +830,12 @@ impl Cpu {
         res
     }
 
-    fn rlca(&mut self) -> u32 {
+    fn rlca(&mut self) {
         self.rg[A as usize] = self.rlc(self.rg[A as usize]);
         if self.z {
             self.z = false;
             self.set_flags();
         }
-        1
     }
 
     fn rr(&mut self, b: u8) -> u8 {
@@ -887,13 +845,12 @@ impl Cpu {
         res
     }
 
-    fn rra(&mut self) -> u32 {
+    fn rra(&mut self) {
         self.rg[A as usize] = self.rr(self.rg[A as usize]);
         if self.z {
             self.z = false;
             self.set_flags();
         }
-        1
     }
 
     fn rrc(&mut self, b: u8) -> u8 {
@@ -903,19 +860,21 @@ impl Cpu {
         res
     }
 
-    fn rrca(&mut self) -> u32 {
+    fn rrca(&mut self) {
         self.rg[A as usize] = self.rrc(self.rg[A as usize]);
         if self.z {
             self.z = false;
             self.set_flags();
         }
-        1
     }
 
-    fn rst(&mut self, opcode: u8) -> u32 {
+    fn rst(&mut self, opcode: u8) {
+        // INSTR: RST vec
+        // FETCH OP: 1M
+        // CALL: 3M
+        // TOTAL: 4M
         let vec: u16 = (opcode - 0xC7) as u16;
         self.call(vec);
-        4
     }
 
     fn serial_control(&mut self, sc: u8) {
@@ -958,9 +917,18 @@ impl Cpu {
         res
     }
 
-    fn stop(&mut self) -> u32 {
-        self.next_byte();
-        1
+    fn step_timers(&mut self) {
+        self.div.step();
+        self.tima.cycle(self.div.tick);
+        self.div.tick = false;
+        if self.tima.delay_out {
+            self.iflags.timer = true;
+        }
+        self.m_cycles += 1;
+    }
+
+    fn stop(&mut self) {
+        self.pc += 1;
     }
 
     fn swap(&mut self, b: u8) -> u8 {
@@ -968,53 +936,16 @@ impl Cpu {
         (b << 4) | (b >> 4)
     }
 
-    fn timers(&mut self, m_cycles: u32) {
-        self.div_acc += m_cycles;
-        if self.tac_enable {
-            self.tima_acc += m_cycles;
-        }
-
-        while self.div_acc >= 64 {
-            self.div_acc -= 64;
-            let div: u8 = self.read_byte(DIV);
-            self.write_byte(DIV, div.wrapping_add(1));
-        }
-
-        while self.tac_enable && self.tima_acc >= self.tac_select {
-            self.tima_acc -= self.tac_select;
-            let tima: u8 = self.read_byte(TIMA);
-            if tima == 0xFF {
-                let tma: u8 = self.read_byte(TMA);
-                self.write_byte(TIMA, tma);
-                self.iflags.timer = true;
-            } else {
-                self.write_byte(TIMA, tima + 1);
-            }
-        }
-    }
-
     fn write_byte(&mut self, addr: u16, b: u8) {
+        self.step_timers();
         match addr {
             SB => self.sb = b,
             SC => self.serial_control(b),
             IF => self.iflags.set(b),
-            DIV => self.io[DIV as usize - 0xFF00] = 0,
-            TAC => {
-                self.tac_select = {
-                    let bits: u8 = b & 0b11;
-                    if bits == 0b00 {
-                        256
-                    } else if bits == 0b01 {
-                        4
-                    } else if bits == 0b10 {
-                        16
-                    } else {
-                        64
-                    }
-                };
-                self.tac_enable = (b >> 2) & 1 == 1;
-                self.io[TAC as usize - 0xFF00] = b;
-            }
+            DIV => self.div.reset(),
+            TMA => self.tima.tma = b,
+            TIMA => self.tima.set_tima(b),
+            TAC => self.div.tac = b,
             0xFF00..0xFF80 => self.io[addr as usize - 0xFF00] = b,
             0xFF80..0xFFFF => self.hram[addr as usize - 0xFF80] = b,
             IE => self.ienable.set(b),
@@ -1088,10 +1019,10 @@ impl Cpu {
         write!(
             self.debug_log,
             "PCMEM:{:02X},{:02X},{:02X},{:02X}\n",
-            self.read_byte(self.pc),
-            self.read_byte(self.pc + 1),
-            self.read_byte(self.pc + 2),
-            self.read_byte(self.pc + 3)
+            self.mmu.read_byte(self.pc),
+            self.mmu.read_byte(self.pc + 1),
+            self.mmu.read_byte(self.pc + 2),
+            self.mmu.read_byte(self.pc + 3)
         )
         .unwrap();
         self.debug_log.flush().unwrap();

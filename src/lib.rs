@@ -1,5 +1,4 @@
 use crate::cpu::{Cpu, CpuTickOutput};
-use anyhow::bail;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::Duration;
 
@@ -7,6 +6,7 @@ mod constants;
 pub mod cpu;
 pub mod mbc;
 pub mod mmu;
+pub mod ppu;
 
 pub const CLOCK_SPEED: u32 = 1048576;
 
@@ -18,7 +18,7 @@ pub struct GbInput {}
 
 pub fn run_cpu(fp: &str) -> (SyncSender<GbInput>, Receiver<GbOutput>) {
     let mut cpu: Cpu = Cpu::new(fp);
-    cpu.boot();
+    cpu.boot_dmg();
     let (gbout_tx, gbout_rx) = std::sync::mpsc::sync_channel(1);
     let (gbin_tx, gbin_rx) = std::sync::mpsc::sync_channel(1);
     let timer_rx: Receiver<()> = timer();
@@ -55,7 +55,9 @@ pub fn timer() -> Receiver<()> {
 }
 
 #[cfg(test)]
-fn test_run(fp: &str) -> anyhow::Result<()> {
+fn test_run(fp: &str) -> anyhow::Result<String> {
+    use anyhow::bail;
+
     let mut out: String = "".to_owned();
     let (gbin_tx, gbout_rx) = run_cpu(fp);
     gbin_tx.send(GbInput {})?;
@@ -65,69 +67,52 @@ fn test_run(fp: &str) -> anyhow::Result<()> {
             out.push(c);
         }
         if out.ends_with("Passed") {
-            return Ok(());
+            return Ok(out);
         } else if out.ends_with("Failed") {
-            bail!("")
+            bail!(out)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::test_run;
+    use crate::{run_cpu, GbInput, GbOutput};
+    use anyhow::bail;
 
-    #[test]
-    fn blargg_01_cpu_special() -> anyhow::Result<()> {
-        test_run("roms/01-special.gb")
+    fn test_agg(fp: &str) -> anyhow::Result<()> {
+        // for blargg aggregate roms (e.g., cpu_instrs)
+
+        let mut test_codes: Vec<String> = Vec::new();
+        let mut output: String = "".to_owned();
+        let (gbin_tx, gbout_rx) = run_cpu(fp);
+        gbin_tx.send(GbInput {})?;
+        loop {
+            let gbout: GbOutput = gbout_rx.recv()?;
+            if let Some(c) = gbout.sb {
+                output.push(c);
+            }
+            output = output.trim_ascii().to_string();
+            match output.as_bytes() {
+                [.., b':', b'o', b'k'] => {
+                    test_codes.push(output.clone());
+                    output = "".to_owned();
+                }
+                [.., t1 @ b'0'..=b'9', t2 @ b'0'..=b'9', b':', b'0'..=b'9', b'0'..=b'9'] => {
+                    bail!("Failed {}{}", *t1 as char, *t2 as char);
+                }
+                _ => (),
+            }
+
+            if output.ends_with("Passed") || test_codes.len() >= 11 {
+                return Ok(());
+            } else if output.ends_with("Failed") {
+                bail!("Failed!");
+            }
+        }
     }
 
     #[test]
-    fn blargg_02_interrupts() -> anyhow::Result<()> {
-        test_run("roms/02-interrupts.gb")
-    }
-
-    #[test]
-    fn blargg_03_cpu_op_sp_hl() -> anyhow::Result<()> {
-        test_run("roms/03-op sp,hl.gb")
-    }
-
-    #[test]
-    fn blargg_04_cpu_op_r_imm() -> anyhow::Result<()> {
-        test_run("roms/04-op r,imm.gb")
-    }
-
-    #[test]
-    fn blargg_05_cpu_op_rp() -> anyhow::Result<()> {
-        test_run("roms/05-op rp.gb")
-    }
-
-    #[test]
-    fn blargg_06_ld_r_r() -> anyhow::Result<()> {
-        test_run("roms/06-ld r,r.gb")
-    }
-
-    #[test]
-    fn blargg_07_subroutines() -> anyhow::Result<()> {
-        test_run("roms/07-jr,jp,call,ret,rst.gb")
-    }
-
-    #[test]
-    fn blargg_08_misc() -> anyhow::Result<()> {
-        test_run("roms/08-misc instrs.gb")
-    }
-
-    #[test]
-    fn blargg_09_op_r_r() -> anyhow::Result<()> {
-        test_run("roms/09-op r,r.gb")
-    }
-
-    #[test]
-    fn blargg_10_bit_ops() -> anyhow::Result<()> {
-        test_run("roms/10-bit ops.gb")
-    }
-
-    #[test]
-    fn blargg_11_op_a_hl() -> anyhow::Result<()> {
-        test_run("roms/11-op a,(hl).gb")
+    fn blargg_cpu_instrs() -> anyhow::Result<()> {
+        test_agg("roms/cpu_instrs/cpu_instrs.gb")
     }
 }
