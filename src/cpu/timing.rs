@@ -1,105 +1,91 @@
+use crate::utils::*;
 #[derive(Default)]
-pub struct Div {
+pub struct Timer {
     div: u16,
-    div_wires: [bool; 4],
-    pub tac: u8,
-    pub tick: bool,
-}
-
-impl Div {
-    pub fn new() -> Self {
-        Self {
-            div: 0xAB,
-            div_wires: [false; 4],
-            tac: 0,
-            tick: false,
-        }
-    }
-
-    pub fn boot(&mut self, div: u16, tac: u8) {
-        self.div = div;
-        self.tac = tac;
-    }
-
-    pub fn div(&self) -> u8 {
-        (self.div >> 6) as u8
-    }
-
-    pub fn reset(&mut self) {
-        self.div = 0;
-        self.set_wires();
-    }
-
-    pub fn step(&mut self) {
-        if self.div > 0x3FFF {
-            self.div = 0;
-        } else {
-            self.div += 1;
-        }
-        self.set_wires();
-    }
-
-    fn set_wires(&mut self) {
-        let div_wires: [bool; 4] = [
-            bit(self.div, 7),
-            bit(self.div, 1),
-            bit(self.div, 3),
-            bit(self.div, 5),
-        ];
-        let tac_freq: usize = self.tac as usize & 0b11;
-        let tac_enable: bool = (self.tac >> 2) & 1 == 1;
-
-        let falling_edge: bool = self.div_wires[tac_freq] && !div_wires[tac_freq];
-        self.tick = falling_edge && tac_enable;
-        self.div_wires = div_wires;
-    }
-}
-
-#[derive(Default)]
-pub struct Tima {
-    pub tma: u8,
     tima: u8,
-    write_tima: bool,
-    load_tima: bool,
-    ovf: bool,
-    delay_in: bool,
-    pub delay_out: bool,
+    tma: u8,
+    tac: u8,
+    interrupt: bool,
+    pub interrupt_requested: bool,
 }
 
-impl Tima {
-    pub fn new() -> Self {
+impl Timer {
+    pub fn boot() -> Self {
         Self {
-            ..Default::default()
+            div: 0xABCC,
+            tac: 0xF8,
+            ..Self::default()
         }
     }
+    pub fn cycle(&mut self, cycles: u16) -> bool {
+        self.interrupt_requested = false;
 
-    pub fn cycle(&mut self, tick: bool) {
-        if tick {
-            (self.tima, self.ovf) = self.tima.overflowing_add(1);
-        }
-        self.set_wires();
-        if self.load_tima {
+        let interrupt: bool = self.interrupt;
+        if interrupt {
             self.tima = self.tma;
+            self.interrupt_requested = true;
+        }
+        self.interrupt = false;
+        let mut cycles = cycles;
+        while cycles > 0 {
+            let div: u16 = self.div;
+            self.div = self.div.wrapping_add(1);
+            self.tick(div);
+            cycles -= 1;
+        }
+
+        interrupt
+    }
+
+    pub fn read_byte(&self, addr: u16) -> u8 {
+        let r = match addr {
+            DIV => (self.div >> 6) as u8,
+            TIMA => self.tima,
+            TMA => self.tma,
+            TAC => self.tac,
+            _ => unreachable!(),
+        };
+        return r;
+    }
+
+    pub fn write_byte(&mut self, addr: u16, b: u8) {
+        match addr {
+            DIV => {
+                let div: u16 = self.div;
+                self.div = 0;
+                self.tick(div);
+            }
+            TIMA => {
+                if !self.interrupt_requested {
+                    self.tima = b;
+                    self.interrupt = false;
+                }
+            }
+            TMA => {
+                self.tma = b;
+                if self.interrupt_requested {
+                    self.tima = b;
+                }
+            }
+            TAC => self.tac = b,
+            _ => unreachable!(),
+        };
+    }
+
+    fn tick(&mut self, old: u16) {
+        if bit(self.tac as u16, 2) && self.falling_edge(old) {
+            (self.tima, self.interrupt) = self.tima.overflowing_add(1);
         }
     }
 
-    pub fn set_tima(&mut self, tima: u8) {
-        self.tima = tima;
-        self.write_tima = true;
+    fn falling_edge(&self, old: u16) -> bool {
+        let shift: u8 = match self.tac & 3 {
+            0 => 7,
+            1 => 1,
+            2 => 3,
+            3 => 5,
+            _ => unreachable!(),
+        };
+        return bit(old, shift) && !bit(self.div, shift);
     }
-
-    pub fn tima(&self) -> u8 {
-        self.tima
-    }
-
-    fn set_wires(&mut self) {
-        self.delay_out = self.delay_in;
-        self.load_tima = self.write_tima || self.delay_out;
-        self.delay_in = !self.load_tima && self.ovf;
-        self.write_tima = false;
-    }
-}
-
-pub fn bit(b: u16, n: u8) -> bool {
-    (b >> n) & 1 == 1
 }

@@ -1,30 +1,25 @@
-use crate::constants::*;
-use crate::ppu::DMGColour::{Colour0, Colour1, Colour2, Colour3};
 use crate::ppu::PpuMode::*;
-use bitvec::order::Msb0;
-use bitvec::view::BitView;
+use crate::utils::*;
 use std::collections::VecDeque;
 
 pub struct Ppu {
     vram: Vec<u8>,
     ppu_mode: PpuMode,
     pub ly: u8,
+    lyc: u8,
+    scy: u8,
+    scx: u8,
+    wx: u8,
+    wy: u8,
     bgp: u8,
     lx: u8,
-    tmapx: u8,
-    lcd_enable: bool,
-    window_tmap_area: u16,
-    window_enable: bool,
-    bg_win_tdata_area: u16,
-    bg_tmap_area: u16,
-    obj_size: bool,
-    obj_enable: bool,
-    bg_win_pri: bool,
-    display_buffer: Vec<Vec<u8>>,
-    pub frame: Option<Vec<Vec<u8>>>,
+    stat: u8,
+    lcdc: u8,
+    pub display_buffer: Vec<Vec<u8>>,
     bg_fifo: VecDeque<FIFOPixel>,
-    available_dots: u32,
-    dots: u32,
+    available_dots: u16,
+    dots: u16,
+    pub vblank: bool,
 }
 
 impl Ppu {
@@ -33,75 +28,78 @@ impl Ppu {
             vram: vec![0; 0x2000],
             ppu_mode: Mode2,
             ly: 0,
+            lyc: 0,
+            scy: 0,
+            scx: 0,
             bgp: 0,
+            wx: 0,
+            wy: 7,
             lx: 0,
-            tmapx: 0,
-            lcd_enable: false,
-            window_tmap_area: 0x9800,
-            window_enable: false,
-            bg_win_tdata_area: 0x8800,
-            bg_tmap_area: 0x9800,
-            obj_size: false,
-            obj_enable: false,
-            bg_win_pri: false,
+            lcdc: 0,
+            stat: 0,
             display_buffer: vec![vec![0; 160]; 144],
-            frame: None,
             bg_fifo: VecDeque::with_capacity(16),
             available_dots: 0,
             dots: 0,
+            vblank: false,
         }
     }
 
-    pub fn cycle(&mut self) {
-        self.available_dots += 4;
-
-        if self.ppu_mode == Mode0 {
-            if self.available_dots + self.dots >= 456 {
-                self.available_dots = (self.dots + self.available_dots) - 456;
-                self.dots = 0;
-                self.ly = (self.ly + 1) % 154;
-                if self.ly == 144 {
-                    self.ppu_mode = Mode1;
-                    self.frame = Some(self.display_buffer.clone());
-                } else if self.ly == 0 {
-                    self.ppu_mode = Mode2;
-                }
-            }
+    pub fn boot() -> Self {
+        Self {
+            bgp: 0xFC,
+            stat: 0x85,
+            lcdc: 0x91,
+            ..Self::new()
         }
+    }
 
-        if self.ppu_mode == Mode2 {
-            if self.available_dots + self.dots >= 80 {
-                self.available_dots = (self.dots + self.available_dots) - 80;
-                self.dots = 80;
-                self.ppu_mode = Mode3;
+    pub fn cycle(&mut self, cycles: u16) {
+        self.vblank = false;
+        if !bit(self.lcdc, 7) {
+            return;
+        }
+        let mut available_dots = cycles * 4;
+
+        while available_dots > 0 {
+            let dots = if available_dots >= 80 {
+                80
             } else {
-                self.dots += self.available_dots;
-                self.available_dots = 0;
-            }
-        }
+                available_dots
+            };
+            self.dots += dots;
+            available_dots -= dots;
 
-        if self.ppu_mode == Mode3 {
-            if self.dots < 92 {
-                // 80 (Mode2) + 12
-                if self.available_dots + self.dots >= 92 {
-                    // ready to start drawing
-                    self.available_dots = (self.dots + self.available_dots) - 92;
-                    self.dots = 92;
-                } else {
-                    self.dots += self.available_dots;
-                    self.available_dots = 0;
+            if self.dots >= 456 {
+                self.dots -= 456;
+                self.ly = (self.ly + 1) % 154;
+                if self.ly == self.lyc {
+                    self.stat = set(self.stat, 2) as u8;
+                }
+                if self.ly >= 144 && self.ppu_mode != Mode1 {
+                    self.ppu_mode = Mode1;
+                    self.vblank = true;
                 }
             }
-            while self.available_dots >= 8 {
-                self.available_dots -= 8;
-                self.dots += 8;
-                self.fetch_bg();
-                self.display_pixels();
-            }
-            if self.dots >= 172 {
-                self.ppu_mode = Mode0;
+
+            if self.ly < 144 {
+                if self.dots <= 80 {
+                    if self.ppu_mode != Mode2 {
+                        self.ppu_mode = Mode2;
+                    }
+                } else if self.dots <= 80 + 172 {
+                    if self.ppu_mode != Mode3 {
+                        self.ppu_mode = Mode3;
+                    }
+                } else {
+                    if self.ppu_mode != Mode0 {
+                        self.ppu_mode = Mode0;
+                        self.draw_bg();
+                    }
+                }
             }
         }
+        self.stat = (self.stat & 0b1111_1100) | (self.ppu_mode as u8);
     }
 
     pub fn read_byte(&self, addr: u16) -> u8 {
@@ -113,7 +111,15 @@ impl Ppu {
                     0xFF
                 }
             }
+            BGP => self.bgp,
             LY => self.ly,
+            LCDC => self.lcdc,
+            LYC => self.lyc,
+            SCY => self.scy,
+            SCX => self.scx,
+            WY => self.wy,
+            WX => self.wx,
+            STAT => self.stat,
             _ => todo!("UNSUPPORTED READ 0x{:04X}", addr),
         }
     }
@@ -122,68 +128,87 @@ impl Ppu {
         match addr {
             0x8000..0xA000 => {
                 if self.ppu_mode != Mode3 {
+                    // println!("WRITING 0x{:02X} TO VRAM AT 0x{:04X}", b, addr);
                     self.write_vram(addr, b);
+                } else {
+                    println!("FAILED TO WRITE VRAM! MODE {:?}", self.ppu_mode);
                 }
             }
-            LCDC => {
-                self.lcd_enable = ((b >> 7) & 1) == 1;
-                self.window_tmap_area = if ((b >> 6) & 1) == 1 { 0x9C00 } else { 0x9800 };
-                self.window_enable = ((b >> 5) & 1) == 1;
-                self.bg_win_tdata_area = if ((b >> 4) & 1) == 1 { 0x8000 } else { 0x8800 };
-                self.bg_tmap_area = if ((b >> 3) & 1) == 1 { 0x9C00 } else { 0x9800 };
-                self.obj_size = ((b >> 2) & 1) == 1;
-                self.obj_enable = ((b >> 1) & 1) == 1;
-                self.bg_win_pri = (b & 1) == 1;
-            }
-            BGP => {
-                self.bgp = b;
-            }
+            LCDC => self.lcdc = b,
+            BGP => self.bgp = b,
             LY => (),
+            LYC => self.lyc = b,
+            SCY => self.scy = b,
+            SCX => self.scx = b,
+            WY => self.wy = b,
+            WX => self.wx = b,
+            STAT => self.stat = b,
             _ => todo!("UNSUPPORTED WRITE 0x{:04X}", addr),
         }
     }
 
-    fn display_pixels(&mut self) {
-        while let Some(pixel) = self.bg_fifo.pop_front() {
-            let colour: u8 = match pixel.colour {
-                Colour0 => self.bgp & 3,
-                Colour1 => (self.bgp >> 2) & 3,
-                Colour2 => (self.bgp >> 4) & 3,
-                Colour3 => (self.bgp >> 6) & 3,
+    fn draw_bg(&mut self) {
+        let scy: u8 = self.scy.wrapping_add(self.ly);
+        let tiley: u16 = (scy as u16 / 8) % 32;
+        for lx in 0..160u8 {
+            let scx: u8 = self.scx.wrapping_add(lx);
+            let tilex: u16 = (scx as u16 / 8) % 32;
+            let py: u8 = scy % 8;
+            let px: u8 = scx % 8;
+            let tmap_base: u16 = 0x9800 | (bit(self.lcdc, 3) as u16) << 7;
+            let tile_id: u8 = self.read_vram(tmap_base + tiley * 0x20 + tilex);
+            let tile_addr: u16 = if bit(self.lcdc, 4) {
+                0x8000 + 0x10 * tile_id as u16
+            } else {
+                todo!()
             };
-            self.display_buffer[self.ly as usize][self.lx as usize] = colour;
-            self.lx = (self.lx + 1) % 160;
+            let tile_lo: u8 = self.read_vram(tile_addr + 2 * py as u16);
+            let tile_hi: u8 = self.read_vram(tile_addr + 2 * py as u16 + 1);
+            let colour_lsb = bit(tile_lo, 7 - px);
+            let colour_msb = bit(tile_hi, 7 - px);
+            let colour: u8 = match (colour_msb, colour_lsb) {
+                (false, false) => self.bgp & 3,
+                (false, true) => (self.bgp >> 2) & 3,
+                (true, false) => (self.bgp >> 4) & 3,
+                (true, true) => (self.bgp >> 6) & 3,
+            };
+            self.display_buffer[self.ly as usize][lx as usize] = colour;
         }
     }
 
-    fn fetch_bg(&mut self) {
-        let tmapy: u8 = self.ly / 8;
-        let tiley: u8 = self.ly % 8;
-        let tmap_addr: u16 = self.bg_tmap_area + tmapy as u16 * 20 + self.tmapx as u16;
-        let tile_addr: u16 = {
-            if self.bg_win_tdata_area == 0x8000 {
-                // unsigned addressing
-                self.bg_win_tdata_area + self.read_vram(tmap_addr) as u16
-            } else {
-                // signed addressing
-                (0x9000 + self.read_vram(tmap_addr) as i8 as i16 as u16 as u32) as u16
-            }
-        };
-        let tile_lo: u8 = self.read_vram(tile_addr + 2 * tiley as u16);
-        let tile_hi: u8 = self.read_vram(tile_addr + 2 * tiley as u16 + 1);
-        let lo_bits = tile_lo.view_bits::<Msb0>().to_bitvec();
-        let hi_bits = tile_hi.view_bits::<Msb0>().to_bitvec();
-        for tilex in 0..8usize {
-            let colour: DMGColour = match (hi_bits[tilex], lo_bits[tilex]) {
-                (false, false) => Colour0,
-                (false, true) => Colour1,
-                (true, false) => Colour2,
-                (true, true) => Colour3,
-            };
-            self.bg_fifo.push_back(FIFOPixel { colour });
-        }
-        self.tmapx = (self.tmapx + 1) % 20; // 20 * 8 = 160
-    }
+    // fn draw_bg(&mut self) {
+    //     for px in 0..255u8 {
+    //         let tmapx: u8 = self.scx.wrapping_add(px) % 32;
+    //         let tmapy: u8 = self.scy.wrapping_add(self.ly) % 32;
+    //         let tiley: u8 = py % 8;
+    //         let tmap_addr: u16 = self.bg_tmap_area + (tmapy as u16 * 32) + tmapx as u16;
+    //         // println!("READING TMAP 0x{:04X}", tmap_addr);
+    //         let tile_addr: u16 = {
+    //             if self.bg_win_tdata_area == 0x8000 {
+    //                 // unsigned addressing
+    //                 self.bg_win_tdata_area + (self.read_vram(tmap_addr) as u16 * 0x10)
+    //             } else {
+    //                 todo!("uh oh");
+    //             }
+    //         };
+    //         // println!("READING TILE 0x{:04X}", tile_addr);
+    //         let tile_lsb: u8 = self.read_vram(tile_addr + 2 * tiley as u16);
+    //         let tile_msb: u8 = self.read_vram(tile_addr + 2 * tiley as u16 + 1);
+    //         for i in 0..8u8 {
+    //             let tilex = 8 - i;
+    //             let colour_lsb = bit(tile_lsb, tilex);
+    //             let colour_msb = bit(tile_msb, tilex);
+    //             // println!("COLOUR MSB: {:} COLOUR LSB: {:}", colour_msb, colour_lsb);
+    //             let colour: u8 = match (colour_msb, colour_lsb) {
+    //                 (false, false) => self.bgp & 3,
+    //                 (false, true) => (self.bgp >> 2) & 3,
+    //                 (true, false) => (self.bgp >> 4) & 3,
+    //                 (true, true) => (self.bgp >> 6) & 3,
+    //             };
+    //             self.display_buffer[py as usize][px as usize] = colour;
+    //         }
+    //     }
+    // }
 
     fn read_vram(&self, addr: u16) -> u8 {
         self.vram[addr as usize - 0x8000]
@@ -205,7 +230,7 @@ enum DMGColour {
     Colour3,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
 enum PpuMode {
     Mode0,
     Mode1,
