@@ -1,6 +1,5 @@
 use crate::ppu::PpuMode::*;
 use crate::utils::*;
-use std::collections::VecDeque;
 
 pub struct Ppu {
     vram: Vec<u8>,
@@ -16,7 +15,6 @@ pub struct Ppu {
     stat: u8,
     lcdc: u8,
     pub display_buffer: Vec<Vec<u8>>,
-    bg_fifo: VecDeque<FIFOPixel>,
     available_dots: u16,
     dots: u16,
     pub vblank: bool,
@@ -38,7 +36,6 @@ impl Ppu {
             lcdc: 0,
             stat: 0,
             display_buffer: vec![vec![0; 160]; 144],
-            bg_fifo: VecDeque::with_capacity(16),
             available_dots: 0,
             dots: 0,
             vblank: false,
@@ -176,40 +173,6 @@ impl Ppu {
         }
     }
 
-    // fn draw_bg(&mut self) {
-    //     for px in 0..255u8 {
-    //         let tmapx: u8 = self.scx.wrapping_add(px) % 32;
-    //         let tmapy: u8 = self.scy.wrapping_add(self.ly) % 32;
-    //         let tiley: u8 = py % 8;
-    //         let tmap_addr: u16 = self.bg_tmap_area + (tmapy as u16 * 32) + tmapx as u16;
-    //         // println!("READING TMAP 0x{:04X}", tmap_addr);
-    //         let tile_addr: u16 = {
-    //             if self.bg_win_tdata_area == 0x8000 {
-    //                 // unsigned addressing
-    //                 self.bg_win_tdata_area + (self.read_vram(tmap_addr) as u16 * 0x10)
-    //             } else {
-    //                 todo!("uh oh");
-    //             }
-    //         };
-    //         // println!("READING TILE 0x{:04X}", tile_addr);
-    //         let tile_lsb: u8 = self.read_vram(tile_addr + 2 * tiley as u16);
-    //         let tile_msb: u8 = self.read_vram(tile_addr + 2 * tiley as u16 + 1);
-    //         for i in 0..8u8 {
-    //             let tilex = 8 - i;
-    //             let colour_lsb = bit(tile_lsb, tilex);
-    //             let colour_msb = bit(tile_msb, tilex);
-    //             // println!("COLOUR MSB: {:} COLOUR LSB: {:}", colour_msb, colour_lsb);
-    //             let colour: u8 = match (colour_msb, colour_lsb) {
-    //                 (false, false) => self.bgp & 3,
-    //                 (false, true) => (self.bgp >> 2) & 3,
-    //                 (true, false) => (self.bgp >> 4) & 3,
-    //                 (true, true) => (self.bgp >> 6) & 3,
-    //             };
-    //             self.display_buffer[py as usize][px as usize] = colour;
-    //         }
-    //     }
-    // }
-
     fn read_vram(&self, addr: u16) -> u8 {
         self.vram[addr as usize - 0x8000]
     }
@@ -217,17 +180,6 @@ impl Ppu {
     fn write_vram(&mut self, addr: u16, b: u8) {
         self.vram[addr as usize - 0x8000] = b;
     }
-}
-
-struct FIFOPixel {
-    pub colour: DMGColour,
-}
-
-enum DMGColour {
-    Colour0,
-    Colour1,
-    Colour2,
-    Colour3,
 }
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
