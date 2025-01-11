@@ -1,11 +1,10 @@
-use crate::cpu::timing::Timer;
+use crate::cpu::Interrupt::{Joypad, Serial, Stat, TimerInt, VBlank};
 use crate::cpu::ReadWrite::{R, W};
 use crate::cpu::R16::*;
 use crate::cpu::R8::*;
 use crate::mmu::Mmu;
 use crate::utils::*;
 use anyhow::{bail, ensure, Result};
-use std::io::Write;
 
 pub mod timing;
 
@@ -30,8 +29,8 @@ pub struct Cpu {
     pub h: bool,
     pub c: bool,
     halted: bool,
-    timer: Timer,
     garbage: Vec<u8>,
+    dma_cycles: u8,
 }
 
 #[derive(Default)]
@@ -62,8 +61,8 @@ impl Cpu {
             h: false,
             c: false,
             halted: false,
-            timer: Timer::default(),
             garbage: vec![0; 0x10000],
+            dma_cycles: 0,
         }
     }
 
@@ -72,11 +71,10 @@ impl Cpu {
             rg: DMG_REG.to_vec(),
             sb: 0,
             mmu: Mmu::boot(fp),
-            timer: Timer::boot(),
             ..Self::new(fp)
         };
         rv.serial_control(0x7E);
-        rv.iflags.set(0xE1);
+        rv.iflags.line = 0xE1;
         rv.read_flags();
         rv
     }
@@ -101,11 +99,13 @@ impl Cpu {
         let m_cycles: u16 = self.cycle();
         to.m_cycles = m_cycles as u32;
         self.m_cycle(m_cycles);
-        to.draw = self.mmu.ppu.vblank;
+        if self.mmu.ppu.vblank {
+            to.draw = true;
+        }
         if self.sc_enable {
             to.sb = Some(self.sb);
             self.sc_enable = false;
-            self.iflags.serial = true;
+            self.iflags.set(Serial);
         }
         return to;
     }
@@ -528,59 +528,44 @@ impl Cpu {
     }
 
     fn ei(&mut self) -> u16 {
+        // println!("EI");
         self.ei = true;
         1
     }
 
     fn halt(&mut self) -> u16 {
-        if self.ime || self.ienable.read() & self.iflags.read() & 0x1F == 0 {
+        if self.ime || self.ienable.read_first(&self.iflags).is_none() {
             self.halted = true;
             1
         } else {
-            // HALT BUG
+            // TODO HALT BUG
             let opcode: u8 = self.read_byte(self.pc);
             self.exec(opcode)
         }
     }
 
     fn handle_interrupts(&mut self) -> u16 {
-        let pending: bool = self.ienable.read() & self.iflags.read() & 0x1F != 0;
+        let mut cycles: u16 = 0;
+        let pending: Option<Interrupt> = self.ienable.read_first(&self.iflags);
         if self.ime {
-            let halted: u16 = self.halted as u16;
-            if self.ienable.vblank && self.iflags.vblank {
-                self.iflags.vblank = false;
-                self.call(0x0040);
-                self.halted = false;
-                return 5 + halted;
-            } else if self.ienable.lcd && self.iflags.lcd {
-                self.iflags.lcd = false;
-                self.call(0x0048);
-                self.halted = false;
-                return 5 + halted;
-            } else if self.ienable.timer && self.iflags.timer {
-                self.iflags.timer = false;
-                self.call(0x0050);
-                self.halted = false;
-                return 5 + halted;
-            } else if self.ienable.serial && self.iflags.serial {
-                self.iflags.serial = false;
-                self.call(0x0058);
-                self.halted = false;
-                return 5 + halted;
-            } else if self.ienable.joy && self.iflags.joy {
-                self.iflags.joy = false;
-                self.call(0x0060);
-                self.halted = false;
-                return 5 + halted;
+            if let Some(int) = pending {
+                if int == Stat {
+                    // println!("STAT INT SERVE");
+                } else if int == VBlank {
+                    // println!("VBLANK INT SERVE")
+                }
+                self.ime = false;
+                self.push(self.pc);
+                self.pc = int.into();
+                self.iflags.clear(int);
+                cycles += 5;
+                if self.halted {
+                    self.halted = false;
+                    return 1 + cycles;
+                }
             }
         }
-
-        if self.halted && pending {
-            self.halted = false;
-            return 1;
-        } else {
-            return 0;
-        }
+        return cycles;
     }
 
     fn jp(&mut self, cc: bool) -> u16 {
@@ -766,10 +751,26 @@ impl Cpu {
     }
 
     fn m_cycle(&mut self, cycles: u16) {
-        self.step_timers(cycles);
+        let stat: bool = self.mmu.ppu.int_line;
         self.mmu.cycle(cycles);
+        if self.mmu.ppu.dma {
+            let mut cycles: u8 = cycles as u8;
+            while cycles > 0 && self.dma_cycles < 160 {
+                cycles -= 1;
+                let obj: u8 = self.read_byte(self.mmu.ppu.dma_src | self.dma_cycles as u16);
+                self.mmu.ppu.dma_transfer(obj, self.dma_cycles);
+                self.dma_cycles += 1;
+            }
+            if self.dma_cycles >= 160 {
+                self.mmu.ppu.dma = false;
+                self.dma_cycles = 0;
+            }
+        }
         if self.mmu.ppu.vblank {
-            self.iflags.vblank = true;
+            self.iflags.set(VBlank);
+        }
+        if !stat && self.mmu.ppu.int_line {
+            self.iflags.set(Stat);
         }
     }
 
@@ -780,9 +781,8 @@ impl Cpu {
     }
 
     fn next_word(&mut self) -> u16 {
-        let lo: u8 = self.read_byte(self.pc);
-        let hi: u8 = self.read_byte(self.pc + 1);
-        self.pc += 2;
+        let lo: u8 = self.next_byte();
+        let hi: u8 = self.next_byte();
         combine_u8(hi, lo)
     }
 
@@ -847,11 +847,11 @@ impl Cpu {
         match addr {
             SB => self.sb,
             SC => self.read_sc(),
-            IF => self.iflags.read(),
-            TIMA | TMA | TAC | DIV => self.timer.read_byte(addr),
+            IF => self.iflags.line,
+            TIMA | TMA | TAC | DIV => 0xFF,
             0xFF10..0xFF40 => self.garbage[addr as usize], // misc. unimplemented
             0xFF80..0xFFFF => self.hram[addr as usize - 0xFF80],
-            IE => self.ienable.read(),
+            IE => self.ienable.line,
             _ => self.mmu.read_byte(addr),
         }
     }
@@ -1016,13 +1016,6 @@ impl Cpu {
         res
     }
 
-    fn step_timers(&mut self, cycles: u16) {
-        let interrupt: bool = self.timer.cycle(cycles);
-        if interrupt {
-            self.iflags.timer = true;
-        }
-    }
-
     fn stop(&mut self) -> u16 {
         self.pc += 1;
         1
@@ -1037,11 +1030,11 @@ impl Cpu {
         match addr {
             SB => self.sb = b,
             SC => self.serial_control(b),
-            IF => self.iflags.set(b),
-            DIV | TMA | TIMA | TAC => self.timer.write_byte(addr, b),
+            IF => self.iflags.line = b,
+            DIV | TMA | TIMA | TAC => (),
             0xFF10..0xFF40 => self.garbage[addr as usize] = b,
             0xFF80..0xFFFF => self.hram[addr as usize - 0xFF80] = b,
-            IE => self.ienable.set(b),
+            IE => self.ienable.line = b,
             _ => self.mmu.write_byte(addr, b),
         };
     }
@@ -1152,30 +1145,35 @@ pub enum R16 {
 
 #[derive(Default)]
 struct InterruptFlags {
-    joy: bool,
-    serial: bool,
-    timer: bool,
-    lcd: bool,
-    vblank: bool,
+    pub line: u8,
 }
 
 impl InterruptFlags {
-    pub fn set(&mut self, flags: u8) {
-        (self.joy, self.serial, self.timer, self.lcd, self.vblank) = (
-            (flags >> 4) & 1 == 1,
-            (flags >> 3) & 1 == 1,
-            (flags >> 2) & 1 == 1,
-            (flags >> 1) & 1 == 1,
-            flags & 1 == 1,
-        );
+    pub fn clear(&mut self, inte: Interrupt) {
+        self.line &= !(inte as u8);
     }
 
-    pub fn read(&self) -> u8 {
-        (self.joy as u8) << 4
-            | (self.serial as u8) << 3
-            | (self.timer as u8) << 2
-            | (self.lcd as u8) << 1
-            | (self.vblank as u8)
+    pub fn set(&mut self, inte: Interrupt) {
+        self.line |= inte as u8;
+    }
+
+    pub fn read(&self, inte: Interrupt) -> bool {
+        self.line & inte as u8 == inte as u8
+    }
+
+    pub fn read_first(&self, other: &InterruptFlags) -> Option<Interrupt> {
+        if self.read(VBlank) && other.read(VBlank) {
+            return Some(VBlank);
+        } else if self.read(Stat) && other.read(Stat) {
+            return Some(Stat);
+        } else if self.read(TimerInt) && other.read(TimerInt) {
+            return Some(TimerInt);
+        } else if self.read(Serial) && other.read(Serial) {
+            return Some(Serial);
+        } else if self.read(Joypad) && other.read(Joypad) {
+            return Some(Joypad);
+        }
+        return None;
     }
 }
 
@@ -1183,4 +1181,38 @@ impl InterruptFlags {
 enum ReadWrite {
     R,
     W,
+}
+
+#[derive(Eq, PartialEq, Clone, Copy)]
+#[repr(u8)]
+enum Interrupt {
+    VBlank = 1,
+    Stat = 2,
+    TimerInt = 4,
+    Serial = 8,
+    Joypad = 16,
+}
+
+impl Into<u16> for Interrupt {
+    fn into(self) -> u16 {
+        match self {
+            VBlank => 0x40,
+            Stat => 0x48,
+            TimerInt => 0x50,
+            Serial => 0x58,
+            Joypad => 0x60,
+        }
+    }
+}
+
+impl std::fmt::Display for Interrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VBlank => write!(f, "VBLANK"),
+            Stat => write!(f, "STAT"),
+            TimerInt => write!(f, "TIMER"),
+            Serial => write!(f, "SERIAL"),
+            Joypad => write!(f, "JOYPAD"),
+        }
+    }
 }

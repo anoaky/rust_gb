@@ -36,9 +36,13 @@ impl Mmu {
             0x8000..0xA000 => self.ppu.read_byte(addr),
             0xA000..0xC000 => self.cart.read_byte(addr),
             0xC000..0xFE00 => self.wram[a16 & 0x1FFF],
+            0xFE00..0xFF00 => self.ppu.read_byte(addr),
             LCDC..=WX => self.ppu.read_byte(addr),
             0xFF4D => 0xFF,
-            _ => todo!("UNSUPPORTED READ 0x{:04X}", addr),
+            0xFF7F => 0xFF,
+            _ => {
+                panic!("UNSUPPORTED READ 0x{:04X}", addr)
+            }
         }
     }
 
@@ -53,9 +57,13 @@ impl Mmu {
             0x8000..0xA000 => self.ppu.write_byte(addr, v),
             0xA000..0xC000 => self.cart.write_byte(addr, v),
             0xC000..0xFE00 => self.wram[a16 & 0x1FFF] = v,
+            0xFE00..0xFF00 => self.ppu.write_byte(addr, v),
             LCDC..=WX => self.ppu.write_byte(addr, v),
             0xFF4D => (),
-            _ => todo!("UNSUPPORTED WRITE 0x{:04X}", addr),
+            0xFF7F => (),
+            _ => {
+                panic!("UNSUPPORTED WRITE 0x{:04X}", addr)
+            }
         }
     }
 

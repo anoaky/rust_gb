@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
-bitvec = "1.0.1"
 
 [dependencies.sdl2]
 version = "0.37.0"

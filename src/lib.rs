@@ -1,7 +1,6 @@
 use crate::cpu::{Cpu, CpuTickOutput};
-use std::io::{stdout, Write};
-use std::sync::mpsc::{Receiver, SyncSender};
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 pub mod cpu;
 pub mod mbc;
@@ -15,37 +14,37 @@ pub const NANOS_PER_CYCLE: f64 = (1_000_000_000f64) / (CLOCK_SPEED as f64);
 pub struct GbInput {}
 
 pub struct GbOutput {
-    pub frame: Vec<Vec<u8>>,
+    pub frame: [u8; 160 * 144],
 }
 
-pub fn run_cpu(fp: &str) -> (SyncSender<GbInput>, Receiver<GbOutput>) {
-    let mut cpu: Cpu = Cpu::boot(fp);
-    let (gbin_tx, gbin_rx) = std::sync::mpsc::sync_channel(1);
+pub fn run_cpu(fp: &str) -> (Sender<GbInput>, Receiver<Vec<u8>>) {
+    let mut cpu = Box::new(Cpu::boot(fp));
+    let (gbin_tx, gbin_rx) = std::sync::mpsc::channel();
     let (gbout_tx, gbout_rx) = std::sync::mpsc::sync_channel(1);
+    let frame_timer = timer(Duration::new(0, 1_000_000_000u32 / 60));
 
-    std::thread::spawn(move || loop {
-        let mut m_cycles = CLOCK_SPEED;
-        while m_cycles > 0 {
-            gbin_rx.recv().unwrap();
-            let to: CpuTickOutput = cpu.tick();
-            match to.sb {
-                Some(c) => {
-                    print!("{:}", c as char);
-                    stdout().flush().unwrap();
-                }
-                None => (),
-            };
-            if to.draw {
-                gbout_tx
-                    .send(GbOutput {
-                        frame: cpu.mmu.ppu.display_buffer.clone(),
-                    })
-                    .unwrap();
+    std::thread::spawn(move || 'cpu: loop {
+        'draw: loop {
+            match gbin_rx.try_recv() {
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Empty) => (),
+                Err(_) => break 'cpu,
             }
-            m_cycles = m_cycles.saturating_sub(to.m_cycles);
-            let delay_nanos: u32 = (NANOS_PER_CYCLE * (to.m_cycles as f64)) as u32;
-            std::thread::sleep(Duration::new(0, delay_nanos));
+            let to: CpuTickOutput = cpu.tick();
+            // match to.sb {
+            //     Some(c) => {
+            //         print!("{:}", c as char);
+            //         stdout().flush().unwrap();
+            //     }
+            //     None => (),
+            // };
+            if to.draw {
+                match gbout_tx.send(cpu.mmu.ppu.display_buffer.to_vec()) {
+                    Ok(_) => break 'draw,
+                    Err(_) => break 'cpu,
+                }
+            }
         }
+        let _ = frame_timer.recv();
     });
     (gbin_tx, gbout_rx)
 }
@@ -60,4 +59,22 @@ pub fn timer(dur: Duration) -> Receiver<()> {
         }
     });
     rx
+}
+
+struct Stopwatch {
+    instant: Instant,
+}
+
+impl Stopwatch {
+    pub fn start() -> Self {
+        Self {
+            instant: Instant::now(),
+        }
+    }
+
+    pub fn reset(&mut self) -> Duration {
+        let elapsed = self.instant.elapsed();
+        self.instant = Instant::now();
+        return elapsed;
+    }
 }
